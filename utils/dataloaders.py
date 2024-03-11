@@ -444,6 +444,8 @@ class LoadImagesAndLabels(Dataset):
                  single_cls=False,
                  stride=32,
                  pad=0.0,
+                 image_root = '',
+                 json_root = '',
                  min_items=0,
                  prefix=''):
         self.img_size = img_size
@@ -455,38 +457,56 @@ class LoadImagesAndLabels(Dataset):
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
         self.path = path
+        self.image_root = image_root
+        self.json_root = json_root
         self.albumentations = Albumentations(size=img_size) if augment else None
+        path = Path(self.path)   #path img path list txt
+        img_files = [] #files
+        label_files = []
+        if path.is_file():
+            with open(path, 'r') as t:
+                t = t.read().strip().splitlines()
+                img_files += [os.path.join(self.image_root,x) for x in t] # f img path list
+                label_files += [os.path.join(self.json_root,x.split('.')[0]+'.json')for x in t]
+        self.im_files = img_files
+        self.label_files = label_files
+        cache_path = path.with_suffix('.cache')
+        if cache_path.is_file():
+            cache, exists = np.load(cache_path, allow_pickle=True).item()
+        else:
+            cache, exists = self.cache_labels_v1(cache_path,prefix)
 
-        try:
-            f = []  # image files
-            for p in path if isinstance(path, list) else [path]:
-                p = Path(p)  # os-agnostic
-                if p.is_dir():  # dir
-                    f += glob.glob(str(p / '**' / '*.*'), recursive=True)
-                    # f = list(p.rglob('*.*'))  # pathlib
-                elif p.is_file():  # file
-                    with open(p) as t:
-                        t = t.read().strip().splitlines()
-                        parent = str(p.parent) + os.sep
-                        f += [x.replace('./', parent, 1) if x.startswith('./') else x for x in t]  # to global path
-                        # f += [p.parent / x.lstrip(os.sep) for x in t]  # to global path (pathlib)
-                else:
-                    raise FileNotFoundError(f'{prefix}{p} does not exist')
-            self.im_files = sorted(x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in IMG_FORMATS)
-            # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in IMG_FORMATS])  # pathlib
-            assert self.im_files, f'{prefix}No images found'
-        except Exception as e:
-            raise Exception(f'{prefix}Error loading data from {path}: {e}\n{HELP_URL}') from e
+
+        # try:
+        #     f = []  # image files
+        #     for p in path if isinstance(path, list) else [path]:
+        #         p = Path(p)  # os-agnostic
+        #         if p.is_dir():  # dir
+        #             f += glob.glob(str(p / '**' / '*.*'), recursive=True)
+        #             # f = list(p.rglob('*.*'))  # pathlib
+        #         elif p.is_file():  # file
+        #             with open(p) as t:
+        #                 t = t.read().strip().splitlines()
+        #                 parent = str(p.parent) + os.sep
+        #                 f += [x.replace('./', parent, 1) if x.startswith('./') else x for x in t]  # to global path
+        #                 # f += [p.parent / x.lstrip(os.sep) for x in t]  # to global path (pathlib)
+        #         else:
+        #             raise FileNotFoundError(f'{prefix}{p} does not exist')
+        #     self.im_files = sorted(x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in IMG_FORMATS)
+        #     # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in IMG_FORMATS])  # pathlib
+        #     assert self.im_files, f'{prefix}No images found'
+        # except Exception as e:
+        #     raise Exception(f'{prefix}Error loading data from {path}: {e}\n{HELP_URL}') from e
 
         # Check cache
-        self.label_files = img2label_paths(self.im_files)  # labels
-        cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')
-        try:
-            cache, exists = np.load(cache_path, allow_pickle=True).item(), True  # load dict
-            assert cache['version'] == self.cache_version  # matches current version
-            assert cache['hash'] == get_hash(self.label_files + self.im_files)  # identical hash
-        except Exception:
-            cache, exists = self.cache_labels(cache_path, prefix), False  # run cache ops
+        #self.label_files = img2label_paths(self.im_files)  # labels
+        # cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')
+        # try:
+        #     cache, exists = np.load(cache_path, allow_pickle=True).item(), True  # load dict
+        #     assert cache['version'] == self.cache_version  # matches current version
+        #     assert cache['hash'] == get_hash(self.label_files + self.im_files)  # identical hash
+        # except Exception:
+        #     cache, exists = self.cache_labels(cache_path, prefix), False  # run cache ops
 
         # Display cache
         nf, nm, ne, nc, n = cache.pop('results')  # found, missing, empty, corrupt, total
@@ -598,6 +618,67 @@ class LoadImagesAndLabels(Dataset):
                         f"{mem.available / gb:.1f}/{mem.total / gb:.1f}GB available, "
                         f"{'caching images ✅' if cache else 'not caching images ⚠️'}")
         return cache
+    
+
+    def cache_labels_v1(self, path=Path('./labels.cache'), prefix=''):
+        x = {}
+        nm, nf, ne, nc = 0, 0, 0, 0  # number missing, found, empty, duplicate
+        pbar = tqdm(zip(self.img_files, self.label_files), desc='Scanning images', total=len(self.img_files))
+        for i, (im_file, lb_file) in enumerate(pbar):
+            try:
+                # verify images
+                im = Image.open(im_file)
+                im.verify()  # PIL verify
+                shape = exif_size(im)  # image size
+                segments = []  # instance segments
+                # verify labels
+                if os.path.isfile(lb_file):
+                    nf += 1  # label found
+                    with open(lb_file, 'r') as file:
+                        data = json.load(file)
+                    rects = data['rect']
+                    rect_list = []
+                    for r in rects:
+                        cls = 1
+                        x1y1,x2y1,x2y2,x1y2 = r['pos']
+                        x1,y1 = x1y1
+                        x2,y2 = x2y2
+                        xc = x1/2 + x2/2
+                        yc = y1/2 + y2/2
+                        w = x2-x1
+                        h = y2-y1
+                        rect_list.append((cls,xc,yc,w,h))
+                    l = np.array(rect_list,dtype=np.float32)
+                    if len(l):
+                        assert l.shape[1] == 5, 'labels require 5 columns each'
+                        assert (l >= 0).all(), 'negative labels'
+                        assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
+                        assert np.unique(l, axis=0).shape[0] == l.shape[0], 'duplicate labels'
+                    else:
+                        ne += 1  # label empty
+                        l = np.zeros((0, 5), dtype=np.float32)
+                else:
+                    nm += 1  # label missing
+                    l = np.zeros((0, 5), dtype=np.float32)
+                x[im_file] = [l, shape, segments]
+            except Exception as e:
+                nc += 1
+                print(f'{prefix}WARNING: Ignoring corrupted image and/or label {im_file}: {e}')
+
+            pbar.desc = f"{prefix}Scanning '{path.parent / path.stem}' images and labels... " \
+                        f"{nf} found, {nm} missing, {ne} empty, {nc} corrupted"
+        pbar.close()
+
+        if nf == 0:
+            print(f'{prefix}WARNING: No labels found in {path}. See {help_url}')
+
+        x['hash'] = get_hash(self.label_files + self.img_files)
+        x['results'] = nf, nm, ne, nc, i + 1
+        x['version'] = 0.1  # cache version
+        torch.save(x, path)  # save for next time
+        LOGGER.info(f'{prefix}New cache created: {path}')
+        return x
+
 
     def cache_labels(self, path=Path('./labels.cache'), prefix=''):
         # Cache dataset labels, check images and read shapes
@@ -912,6 +993,9 @@ class LoadImagesAndLabels(Dataset):
         return torch.stack(im4, 0), torch.cat(label4, 0), path4, shapes4
 
 
+#class LoadImagesAndLabels_v2(Dataset):
+    
+    
 # Ancillary functions --------------------------------------------------------------------------------------------------
 def flatten_recursive(path=DATASETS_DIR / 'coco128'):
     # Flatten a recursive directory by bringing all files to top level
