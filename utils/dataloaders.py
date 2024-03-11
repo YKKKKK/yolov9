@@ -627,11 +627,13 @@ class LoadImagesAndLabels(Dataset):
         for i, (im_file, lb_file) in enumerate(pbar):
             try:
                 # verify images
+                im_file = os.path.join(self.image_root,im_file)
                 im = Image.open(im_file)
                 im.verify()  # PIL verify
                 shape = exif_size(im)  # image size
                 segments = []  # instance segments
                 # verify labels
+                lb_file = os.path.join(self.json_root,lb_file)
                 if os.path.isfile(lb_file):
                     nf += 1  # label found
                     with open(lb_file, 'r') as file:
@@ -995,7 +997,7 @@ class LoadImagesAndLabels(Dataset):
 
 #class LoadImagesAndLabels_v2(Dataset):
     
-    
+
 # Ancillary functions --------------------------------------------------------------------------------------------------
 def flatten_recursive(path=DATASETS_DIR / 'coco128'):
     # Flatten a recursive directory by bringing all files to top level
